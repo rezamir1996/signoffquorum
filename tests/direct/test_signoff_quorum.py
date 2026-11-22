@@ -8,6 +8,7 @@ import pytest
 ROSTER = "alice:Alice Chen,bob:Bob Ruiz,carol:Carol Diaz"
 PROMPT = r"(?s).*THE ONLY PEOPLE WHO CAN APPROVE.*"
 
+# s1 prepared / s2 alice / s3 bob / s4 carol asked
 ALL_DOC = (
     "Prepared for the board. Approved: Alice Chen. "
     "Approved: Bob Ruiz. Approved: Carol Diaz."
@@ -19,7 +20,7 @@ TWO_DOC = (
 )
 
 ONE_DOC = (
-    "Prepared for the board. Approved: Alice Chen. "
+    "The board met on 3 May. Approved: Alice Chen. "
     "Bob Ruiz asked for a copy. Carol Diaz objected to the schedule."
 )
 
@@ -33,35 +34,41 @@ BUNDLE_DOC = (
     "Carol Diaz asked for the minutes."
 )
 
+TWICE_DOC = "Prepared for the board. Approved: Alice Chen. Approved: Alice Chen."
+
 
 def _gate(direct_deploy, needed="2"):
     return direct_deploy("contracts/signoff_quorum.py", "board", ROSTER, needed)
 
 
-def _answers(*pairs):
-    parts = []
-    for code, quote in pairs:
-        parts.append('{"signer": "' + code + '", "quote": "' + quote + '"}')
-    return '{"approvals": [' + ", ".join(parts) + "]}"
+def _a(code, number):
+    return '{"signer": "' + code + '", "sentence": ' + str(number) + "}"
+
+
+def _aq(code, quote):
+    return '{"signer": "' + code + '", "quote": "' + quote + '"}'
+
+
+def _answers(*items):
+    return '{"approvals": [' + ", ".join(items) + "]}"
 
 
 # ------------------------------------------------------------ the counted quorum
 def test_two_of_three_approvals_is_a_quorum(direct_vm, direct_deploy):
     gate = _gate(direct_deploy)
-    direct_vm.mock_llm(
-        PROMPT, _answers(("alice", "Approved: Alice Chen"), ("bob", "Approved: Bob Ruiz"))
-    )
+    direct_vm.mock_llm(PROMPT, _answers(_a("alice", 2), _a("bob", 3)))
 
     assert gate.check("c1", TWO_DOC) == "QUORUM"
     assert gate.signed_of("c1") == "alice,bob"
     assert gate.missing_of("c1") == "carol"
     assert gate.counts_of("c1") == "2,2"
     assert gate.is_quorate("c1") is True
+    assert gate.unit_count_of("c1") == 4
 
 
 def test_one_approval_against_a_threshold_of_two_is_short(direct_vm, direct_deploy):
     gate = _gate(direct_deploy)
-    direct_vm.mock_llm(PROMPT, _answers(("alice", "Approved: Alice Chen")))
+    direct_vm.mock_llm(PROMPT, _answers(_a("alice", 2)))
 
     assert gate.check("c2", ONE_DOC) == "SHORT"
     assert gate.signed_of("c2") == "alice"
@@ -72,14 +79,7 @@ def test_one_approval_against_a_threshold_of_two_is_short(direct_vm, direct_depl
 
 def test_three_approvals_against_a_threshold_of_three(direct_vm, direct_deploy):
     gate = _gate(direct_deploy, needed="3")
-    direct_vm.mock_llm(
-        PROMPT,
-        _answers(
-            ("alice", "Approved: Alice Chen"),
-            ("bob", "Approved: Bob Ruiz"),
-            ("carol", "Approved: Carol Diaz"),
-        ),
-    )
+    direct_vm.mock_llm(PROMPT, _answers(_a("alice", 2), _a("bob", 3), _a("carol", 4)))
 
     assert gate.check("c3", ALL_DOC) == "QUORUM"
     assert gate.signed_of("c3") == "alice,bob,carol"
@@ -90,98 +90,116 @@ def test_three_approvals_against_a_threshold_of_three(direct_vm, direct_deploy):
 def test_the_same_person_twice_is_not_two_approvals(direct_vm, direct_deploy):
     """The counted quorum is over people, not over lines."""
     gate = _gate(direct_deploy)
-    direct_vm.mock_llm(
-        PROMPT,
-        _answers(("alice", "Approved: Alice Chen"), ("alice", "Approved: Alice Chen again")),
-    )
+    direct_vm.mock_llm(PROMPT, _answers(_a("alice", 2), _a("alice", 3)))
 
     assert gate.check("c4", DUP_DOC) == "SHORT"
     assert gate.signed_of("c4") == ""
     assert gate.counts_of("c4") == "0,2"
     assert gate.is_quorate("c4") is False
+    assert gate.line_of("c4", "alice") == ""
 
 
 def test_one_line_that_names_two_people_approves_both(direct_vm, direct_deploy):
     gate = _gate(direct_deploy)
-    line = "Approved: Alice Chen and Bob Ruiz"
-    direct_vm.mock_llm(PROMPT, _answers(("alice", line), ("bob", line)))
+    direct_vm.mock_llm(PROMPT, _answers(_a("alice", 2), _a("bob", 2)))
 
     assert gate.check("c5", BUNDLE_DOC) == "QUORUM"
     assert gate.signed_of("c5") == "alice,bob"
-    assert gate.quote_of("c5", "alice") == line
-    assert gate.quote_of("c5", "bob") == line
+    assert gate.line_of("c5", "alice") == "s2"
+    assert gate.line_of("c5", "bob") == "s2"
 
 
-# ---------------------------------------------------- every line is re-checked
-def test_a_line_that_is_not_in_the_document_is_dropped(direct_vm, direct_deploy):
+# --------------------------------------------- the number is re-checked by code
+def test_a_number_that_does_not_name_the_signer_is_dropped(direct_vm, direct_deploy):
+    """A name cannot be borrowed: Alice cannot be approved by Bob's sentence."""
     gate = _gate(direct_deploy)
-    direct_vm.mock_llm(
-        PROMPT,
-        _answers(("alice", "Approved: Alice Chen at nine"), ("bob", "Approved: Bob Ruiz")),
-    )
+    direct_vm.mock_llm(PROMPT, _answers(_a("alice", 3), _a("bob", 3)))
 
     assert gate.check("d1", TWO_DOC) == "SHORT"
     assert gate.signed_of("d1") == "bob"
-    assert gate.quote_of("d1", "alice") == ""
+    assert gate.counts_of("d1") == "1,2"
 
 
-def test_a_line_that_does_not_name_the_signer_is_dropped(direct_vm, direct_deploy):
-    """A name cannot be borrowed: Alice cannot be approved by a line about Bob."""
+def test_a_sentence_without_an_approval_word_is_not_an_approval(
+    direct_vm, direct_deploy
+):
+    """"Carol Diaz objected to the schedule" is a sentence with a name and no yes."""
     gate = _gate(direct_deploy)
-    direct_vm.mock_llm(
-        PROMPT, _answers(("alice", "Approved: Bob Ruiz"), ("bob", "Approved: Bob Ruiz"))
-    )
+    direct_vm.mock_llm(PROMPT, _answers(_a("alice", 2), _a("carol", 4)))
 
-    assert gate.check("d2", TWO_DOC) == "SHORT"
-    assert gate.signed_of("d2") == "bob"
-    assert gate.counts_of("d2") == "1,2"
+    assert gate.check("d2", ONE_DOC) == "SHORT"
+    assert gate.signed_of("d2") == "alice"
+    assert gate.missing_of("d2") == "bob,carol"
 
 
-def test_a_line_without_an_approval_word_is_dropped(direct_vm, direct_deploy):
-    """"Carol Diaz objected to the schedule" is a line with a name and no yes in it."""
+def test_a_number_outside_the_document_is_dropped(direct_vm, direct_deploy):
     gate = _gate(direct_deploy)
-    direct_vm.mock_llm(
-        PROMPT,
-        _answers(("alice", "Approved: Alice Chen"), ("carol", "Carol Diaz objected")),
-    )
+    direct_vm.mock_llm(PROMPT, _answers(_a("alice", 9), _a("bob", 3)))
 
-    assert gate.check("d3", ONE_DOC) == "SHORT"
-    assert gate.signed_of("d3") == "alice"
-    assert gate.missing_of("d3") == "bob,carol"
+    assert gate.check("d3", TWO_DOC) == "SHORT"
+    assert gate.signed_of("d3") == "bob"
 
 
 def test_a_signer_outside_the_roster_is_never_counted(direct_vm, direct_deploy):
     gate = _gate(direct_deploy)
-    direct_vm.mock_llm(
-        PROMPT,
-        _answers(("dave", "Approved: Alice Chen"), ("alice", "Approved: Alice Chen")),
-    )
+    direct_vm.mock_llm(PROMPT, _answers(_a("dave", 2), _a("alice", 2)))
 
     assert gate.check("d4", TWO_DOC) == "SHORT"
     assert gate.signed_of("d4") == "alice"
     assert gate.missing_of("d4") == "bob,carol"
 
 
-def test_a_line_too_short_to_mean_anything_is_dropped(direct_vm, direct_deploy):
-    gate = _gate(direct_deploy)
-    direct_vm.mock_llm(PROMPT, _answers(("alice", "yes"), ("bob", "Approved: Bob Ruiz")))
-
-    assert gate.check("d5", TWO_DOC) == "SHORT"
-    assert gate.signed_of("d5") == "bob"
-
-
-def test_every_counted_line_is_readable_from_the_chain(direct_vm, direct_deploy):
+def test_a_quote_alone_is_enough_to_locate_the_sentence(direct_vm, direct_deploy):
+    """A node that only manages to quote the line still lands on the same number."""
     gate = _gate(direct_deploy)
     direct_vm.mock_llm(
-        PROMPT, _answers(("alice", "Approved: Alice Chen"), ("bob", "Approved: Bob Ruiz"))
+        PROMPT,
+        _answers(_aq("alice", "Approved: Alice Chen."), _aq("bob", "Approved: Bob Ruiz")),
     )
-    gate.check("d6", TWO_DOC)
 
-    assert gate.quote_of("d6", "alice") == "Approved: Alice Chen"
-    assert gate.quote_of("d6", "bob") == "Approved: Bob Ruiz"
-    assert gate.quote_of("d6", "carol") == ""
-    assert gate.quote_of("d6", "nobody") == ""
-    assert gate.text_of("d6") == TWO_DOC
+    assert gate.check("d5", TWO_DOC) == "QUORUM"
+    assert gate.line_of("d5", "alice") == "s2"
+    assert gate.line_of("d5", "bob") == "s3"
+
+
+def test_a_quote_that_sits_in_two_sentences_is_a_guess_and_is_dropped(
+    direct_vm, direct_deploy
+):
+    gate = _gate(direct_deploy)
+    direct_vm.mock_llm(PROMPT, _answers(_aq("alice", "Approved: Alice Chen")))
+
+    assert gate.check("d6", TWICE_DOC) == "SHORT"
+    assert gate.signed_of("d6") == ""
+    assert gate.counts_of("d6") == "0,2"
+
+
+def test_a_quote_that_contradicts_its_number_is_resolved_by_the_quote(
+    direct_vm, direct_deploy
+):
+    """The number is a hint; the contract still decides which sentence the words are in."""
+    gate = _gate(direct_deploy)
+    direct_vm.mock_llm(
+        PROMPT,
+        '{"approvals": [{"signer": "bob", "sentence": 2, "quote": "Approved: Bob Ruiz"}]}',
+    )
+
+    assert gate.check("d7", TWO_DOC) == "SHORT"
+    assert gate.signed_of("d7") == "bob"
+    assert gate.line_of("d7", "bob") == "s3"
+
+
+def test_every_counted_number_can_be_audited_from_the_chain(direct_vm, direct_deploy):
+    gate = _gate(direct_deploy)
+    direct_vm.mock_llm(PROMPT, _answers(_a("alice", 2), _a("bob", 3)))
+    gate.check("d8", TWO_DOC)
+
+    assert gate.line_of("d8", "alice") == "s2"
+    assert gate.unit_text("d8", 2) == "approved alice chen"
+    assert gate.unit_text("d8", 3) == "approved bob ruiz"
+    assert gate.unit_text("d8", 9) == ""
+    assert gate.unit_text("d8", 0) == ""
+    assert gate.line_of("d8", "carol") == ""
+    assert gate.text_of("d8") == TWO_DOC
 
 
 # ------------------------------------------------------------ unusable readings
@@ -194,7 +212,6 @@ def test_prose_instead_of_answers_is_unusable(direct_vm, direct_deploy):
     assert gate.missing_of("u1") == "alice,bob,carol"
     assert gate.counts_of("u1") == "0,2"
     assert gate.is_quorate("u1") is False
-    assert gate.quote_of("u1", "alice") == ""
 
 
 def test_a_payload_without_approvals_is_unusable(direct_vm, direct_deploy):
@@ -211,9 +228,9 @@ def test_an_approval_that_is_not_an_object_is_unusable(direct_vm, direct_deploy)
     assert gate.check("u3", ONE_DOC) == "UNUSABLE"
 
 
-def test_a_quote_that_is_not_a_string_is_unusable(direct_vm, direct_deploy):
+def test_a_signer_that_is_not_a_string_is_unusable(direct_vm, direct_deploy):
     gate = _gate(direct_deploy)
-    direct_vm.mock_llm(PROMPT, '{"approvals": [{"signer": "alice", "quote": 7}]}')
+    direct_vm.mock_llm(PROMPT, '{"approvals": [{"signer": 7, "sentence": 2}]}')
 
     assert gate.check("u4", ONE_DOC) == "UNUSABLE"
 
@@ -231,69 +248,92 @@ def test_an_empty_answer_is_a_reading_that_proves_nothing(direct_vm, direct_depl
 
 def test_a_checked_case_is_recorded(direct_vm, direct_deploy):
     gate = _gate(direct_deploy)
-    direct_vm.mock_llm(PROMPT, _answers(("alice", "Approved: Alice Chen")))
+    direct_vm.mock_llm(PROMPT, _answers(_a("alice", 2)))
     gate.check("u6", ONE_DOC)
     assert gate.verdict_of("u6") == "SHORT"
     assert gate.case_count() == 1
 
 
 # -------------------------------------------------------------------- validator
-def test_validator_agrees_when_the_lines_match(direct_vm, direct_deploy):
+def test_validator_agrees_when_the_numbers_match(direct_vm, direct_deploy):
     gate = _gate(direct_deploy)
-    direct_vm.mock_llm(
-        PROMPT, _answers(("alice", "Approved: Alice Chen"), ("bob", "Approved: Bob Ruiz"))
-    )
+    direct_vm.mock_llm(PROMPT, _answers(_a("alice", 2), _a("bob", 3)))
     gate.check("v1", TWO_DOC)
 
     assert direct_vm.run_validator() is True
 
 
-def test_validator_rejects_a_line_the_leader_invented(direct_vm, direct_deploy):
+def test_validator_agrees_even_when_the_quotes_differ(direct_vm, direct_deploy):
+    """The lesson from the live deploy: a trailing period must not split the vote."""
     gate = _gate(direct_deploy)
-    direct_vm.mock_llm(PROMPT, _answers(("alice", "Approved: Alice Chen")))
-    gate.check("v2", ONE_DOC)
+    direct_vm.mock_llm(
+        PROMPT,
+        '{"approvals": [{"signer": "alice", "sentence": 2, '
+        '"quote": "Approved: Alice Chen."}, '
+        '{"signer": "bob", "sentence": 3, "quote": "Approved: Bob Ruiz."}]}',
+    )
+    gate.check("v2", TWO_DOC)
 
-    forged = {"signal": "OK:alice=Approved: Alice Chen|bob=Approved: Bob Ruiz"}
-    assert direct_vm.run_validator(leader_result=forged) is False
+    forged = {"signal": "OK:alice=s2|bob=s3"}
+    assert direct_vm.run_validator(leader_result=forged) is True
 
 
-def test_validator_rejects_an_extra_approval(direct_vm, direct_deploy):
+def test_validator_rejects_a_sentence_the_leader_invented(direct_vm, direct_deploy):
     gate = _gate(direct_deploy)
-    direct_vm.mock_llm(PROMPT, _answers(("alice", "Approved: Alice Chen")))
-    gate.check("v3", TWO_DOC)
+    direct_vm.mock_llm(PROMPT, _answers(_a("alice", 2)))
+    gate.check("v3", ONE_DOC)
 
-    assert direct_vm.run_validator(leader_result={"signal": "OK:alice=Approved: Alice Chen,bob"}) is False
+    assert direct_vm.run_validator(leader_result={"signal": "OK:alice=s2|bob=s3"}) is False
+
+
+def test_validator_rejects_a_number_pointing_at_the_wrong_person(
+    direct_vm, direct_deploy
+):
+    gate = _gate(direct_deploy)
+    direct_vm.mock_llm(PROMPT, _answers(_a("alice", 2)))
+    gate.check("v4", TWO_DOC)
+
+    assert direct_vm.run_validator(leader_result={"signal": "OK:alice=s3"}) is False
+
+
+def test_validator_rejects_a_signal_that_points_nowhere(direct_vm, direct_deploy):
+    gate = _gate(direct_deploy)
+    direct_vm.mock_llm(PROMPT, _answers(_a("alice", 2)))
+    gate.check("v5", TWO_DOC)
+
+    assert direct_vm.run_validator(leader_result={"signal": "OK:alice=s9"}) is False
 
 
 def test_validator_rejects_a_reading_reported_as_unusable(direct_vm, direct_deploy):
     gate = _gate(direct_deploy)
-    direct_vm.mock_llm(PROMPT, _answers(("alice", "Approved: Alice Chen")))
-    gate.check("v4", ONE_DOC)
+    direct_vm.mock_llm(PROMPT, _answers(_a("alice", 2)))
+    gate.check("v6", ONE_DOC)
 
     assert direct_vm.run_validator(leader_result={"signal": "UNUSABLE"}) is False
 
 
-def test_validator_rejects_a_broken_reading_reported_as_a_quorum(direct_vm, direct_deploy):
+def test_validator_rejects_a_broken_reading_reported_as_a_quorum(
+    direct_vm, direct_deploy
+):
     gate = _gate(direct_deploy)
     direct_vm.mock_llm(PROMPT, "not json at all")
-    gate.check("v5", TWO_DOC)
+    gate.check("v7", TWO_DOC)
 
-    forged = {"signal": "OK:alice=Approved: Alice Chen|bob=Approved: Bob Ruiz"}
-    assert direct_vm.run_validator(leader_result=forged) is False
+    assert direct_vm.run_validator(leader_result={"signal": "OK:alice=s2|bob=s3"}) is False
 
 
 def test_validator_rejects_a_payload_without_a_signal(direct_vm, direct_deploy):
     gate = _gate(direct_deploy)
-    direct_vm.mock_llm(PROMPT, _answers(("alice", "Approved: Alice Chen")))
-    gate.check("v6", ONE_DOC)
+    direct_vm.mock_llm(PROMPT, _answers(_a("alice", 2)))
+    gate.check("v8", ONE_DOC)
 
     assert direct_vm.run_validator(leader_result={"signed": "alice"}) is False
 
 
 def test_validator_rejects_a_leader_that_errored(direct_vm, direct_deploy):
     gate = _gate(direct_deploy)
-    direct_vm.mock_llm(PROMPT, _answers(("alice", "Approved: Alice Chen")))
-    gate.check("v7", ONE_DOC)
+    direct_vm.mock_llm(PROMPT, _answers(_a("alice", 2)))
+    gate.check("v9", ONE_DOC)
 
     assert direct_vm.run_validator(leader_error=RuntimeError("boom")) is False
 
@@ -334,6 +374,7 @@ def test_an_unknown_case_fails_closed(direct_vm, direct_deploy):
     assert gate.is_quorate("never-seen") is False
     assert gate.verdict_of("never-seen") == ""
     assert gate.signed_of("never-seen") == ""
+    assert gate.line_of("never-seen", "alice") == ""
 
 
 def test_a_case_is_checked_once(direct_vm, direct_deploy):
@@ -358,15 +399,27 @@ def test_a_short_document_is_refused(direct_vm, direct_deploy):
 
 def test_a_document_with_no_words_is_refused(direct_vm, direct_deploy):
     gate = _gate(direct_deploy)
-    with direct_vm.expect_revert("BAD_TEXT"):
-        gate.check("r3", "............")
+    with direct_vm.expect_revert("NO_UNITS"):
+        gate.check("r3", "." * 24)
 
 
-def test_a_page_of_sentences_that_prove_nothing_is_still_short(direct_vm, direct_deploy):
+def test_a_document_with_too_many_sentences_is_refused(direct_vm, direct_deploy):
+    """81 sentences is over the bound. Refused, never trimmed to the first 80."""
+    gate = _gate(direct_deploy)
+    pieces = []
+    for index in range(81):
+        pieces.append("Item " + str(index) + " was noted by the board.")
+    with direct_vm.expect_revert("TOO_MANY_UNITS"):
+        gate.check("r4", " ".join(pieces))
+
+
+def test_a_page_of_sentences_that_prove_nothing_is_still_short(
+    direct_vm, direct_deploy
+):
     gate = _gate(direct_deploy)
     direct_vm.mock_llm(PROMPT, '{"approvals": []}')
-    assert gate.check("r4", "The board met. The board will meet again.") == "SHORT"
-    assert gate.missing_of("r4") == "alice,bob,carol"
+    assert gate.check("r5", "The board met. The board will meet again.") == "SHORT"
+    assert gate.missing_of("r5") == "alice,bob,carol"
 
 
 # ------------------------------------------------------------------ construction
